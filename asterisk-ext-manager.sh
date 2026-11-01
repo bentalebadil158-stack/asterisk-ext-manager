@@ -15,7 +15,9 @@
 #   (un archivo aparte que se incluye desde pjsip.conf). Así nunca tocamos tu
 #   pjsip.conf a mano y las bajas son limpias.
 #
-# Uso:  sudo ./asterisk-ext-manager.sh
+# Uso:  sudo bash asterisk-ext-manager.sh
+#       Si Asterisk no está instalado, el script ofrece instalarlo (apt).
+#       Modo prueba sin Asterisk: SKIP_INSTALL_CHECK=1 AST_DIR=/tmp/ast-test bash asterisk-ext-manager.sh
 # =============================================================================
 
 set -u
@@ -170,6 +172,8 @@ alta_extension() {
 
     preparar_archivo
     asegurar_include  || { msg "Sin el #include en pjsip.conf las extensiones no se cargarán. Operación cancelada." 9; return; }
+    desactivar_chan_sip
+    asegurar_transporte || { msg "Sin un transporte PJSIP los teléfonos no podrán registrarse. Operación cancelada." 9; return; }
     asegurar_contexto || { msg "Sin el contexto [$CONTEXTO] las llamadas no funcionarán. Operación cancelada." 9; return; }
 
     backup "$EXT_FILE"
@@ -232,6 +236,71 @@ estado_registros() {
     rm -f "$tmp"
 }
 
+# ---- Instalación de Asterisk (si no está) -----------------------------------
+instalar_asterisk() {
+    local log rc
+    command -v apt-get >/dev/null 2>&1 || { msg "El instalador automático solo soporta Ubuntu/Debian (apt)." 8; return 1; }
+
+    log=$(mktemp)
+    whiptail --title "$TITULO" --infobox "Instalando Asterisk desde los repositorios...\nPuede tardar unos minutos." 8 56
+    { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y asterisk; } >"$log" 2>&1
+    rc=$?
+    if (( rc != 0 )); then
+        whiptail --title "$TITULO" --scrolltext --textbox "$log" 24 100
+        rm -f "$log"
+        return 1
+    fi
+    rm -f "$log"
+
+    systemctl enable --now asterisk >/dev/null 2>&1
+    sleep 2
+    msg "Asterisk instalado.\n\nVersión:  $(asterisk -V 2>&1)\nServicio: $(systemctl is-active asterisk 2>&1)" 11
+}
+
+comprobar_asterisk() {
+    [[ -n "${SKIP_INSTALL_CHECK:-}" ]] && return 0     # modo prueba (sin Asterisk real)
+    if command -v asterisk >/dev/null 2>&1 && [[ -d "$AST_DIR" ]]; then
+        return 0
+    fi
+    if whiptail --title "$TITULO" --yesno "Asterisk no está instalado en este equipo.\n\n¿Quieres instalarlo ahora con apt?" 10 64; then
+        instalar_asterisk || return 1
+        [[ -d "$AST_DIR" ]]
+    else
+        return 1
+    fi
+}
+
+desactivar_chan_sip() {   # chan_sip (SIP antiguo) puede ocupar el 5060 y bloquear PJSIP
+    local mc="$AST_DIR/modules.conf"
+    command -v asterisk >/dev/null 2>&1 || return 0
+    [[ -f "$mc" ]] || return 0
+    grep -qE '^[[:space:]]*noload[[:space:]]*=>?[[:space:]]*chan_sip\.so' "$mc" && return 0
+    asterisk -rx "module show like chan_sip" 2>/dev/null | grep -q 'chan_sip\.so' || return 0
+    if whiptail --title "$TITULO" --yesno \
+        "El módulo antiguo chan_sip está cargado y ocupa el puerto 5060, lo que impide que PJSIP cree su transporte.\n\n¿Desactivarlo (noload) y reiniciar Asterisk?\n(Se hace copia de seguridad de modules.conf.)" 14 72; then
+        backup "$mc"
+        if grep -q '^\[modules\]' "$mc"; then
+            sed -i '/^\[modules\]/a noload = chan_sip.so' "$mc"
+        else
+            printf '\n[modules]\nnoload = chan_sip.so\n' >> "$mc"
+        fi
+        systemctl restart asterisk
+        sleep 2
+    fi
+    return 0
+}
+
+asegurar_transporte() {   # PJSIP necesita al menos un transporte (UDP 5060) para registrar teléfonos
+    grep -qEh '^[[:space:]]*type[[:space:]]*=[[:space:]]*transport' "$AST_DIR"/pjsip*.conf 2>/dev/null && return 0
+    if whiptail --title "$TITULO" --yesno \
+        "No hay ningún transporte PJSIP definido.\n\n¿Añadir [transport-udp] (UDP 5060) a pjsip.conf?\n(Se hace copia de seguridad antes.)" 12 66; then
+        backup "$PJSIP_CONF"
+        printf '\n[transport-udp]\ntype=transport\nprotocol=udp\nbind=0.0.0.0:5060\n' >> "$PJSIP_CONF"
+        return 0
+    fi
+    return 1
+}
+
 # ---- Programa principal -----------------------------------------------------
 menu_principal() {
     local op
@@ -260,7 +329,8 @@ main() {
     [[ $EUID -eq 0 ]] || die "Ejecuta el script con sudo."
     command -v whiptail >/dev/null 2>&1 || die "Falta whiptail: sudo apt install whiptail"
     command -v openssl  >/dev/null 2>&1 || die "Falta openssl: sudo apt install openssl"
-    [[ -d "$AST_DIR" ]] || die "No existe $AST_DIR. ¿Está Asterisk instalado?"
+    comprobar_asterisk || die "Asterisk no está instalado. Instálalo y vuelve a ejecutar el script."
+    [[ -d "$AST_DIR" ]] || die "No existe $AST_DIR."
     menu_principal
 }
 
@@ -268,3 +338,4 @@ main() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi
+
